@@ -1,0 +1,11 @@
+node_modules
+dist
+.env
+.DS_Store
+
+# Backend
+backend/venv/
+backend/__pycache__/
+backend/data/
+backend/exports/
+backend/openbench.db
