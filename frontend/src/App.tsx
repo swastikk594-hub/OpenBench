@@ -55,6 +55,7 @@ export default function App() {
   
   const [stats, setStats] = useState({ hz: 0, pkts: 0 });
   const [timeStr, setTimeStr] = useState("0.00");
+  const [experiments, setExperiments] = useState<any[]>([]);
   const [latestData, setLatestData] = useState<Record<string, number>>({});
   const channels = Object.keys(latestData);
   
@@ -81,8 +82,15 @@ export default function App() {
   const fetchExperiments = async () => {
     try {
       const res = await fetch("http://localhost:8000/api/experiments");
-      setExperiments(await res.json());
-    } catch(e) {}
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        setExperiments(data);
+      } else {
+        setExperiments([]);
+      }
+    } catch(e) {
+      setExperiments([]);
+    }
   };
 
   const createExperiment = async () => {
@@ -466,7 +474,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {experiments.map(e => (
+                  {(experiments || []).map(e => (
                     <tr key={e.id} className="hover:bg-[#2a2a2b] transition-colors">
                       <td className="p-3 border border-[#333]">{e.name}</td>
                       <td className="p-3 border border-[#333] text-xs text-[#888] truncate max-w-[200px]">{e.description}</td>
@@ -487,7 +495,7 @@ export default function App() {
                       </td>
                     </tr>
                   ))}
-                  {experiments.length === 0 && (
+                  {(experiments || []).length === 0 && (
                     <tr>
                       <td colSpan={5} className="p-6 text-center text-[#888]">No experiments recorded yet.</td>
                     </tr>
