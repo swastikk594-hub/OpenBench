@@ -4,6 +4,7 @@ import time
 import os
 import math
 import random
+import uuid
 import h5py
 import pandas as pd
 import serial
@@ -11,18 +12,38 @@ import serial.tools.list_ports
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from sqlalchemy import create_engine, Column, Integer, String
-from sqlalchemy.orm import declarative_base, sessionmaker
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from contextlib import asynccontextmanager
 
 # --- Database Setup ---
 Base = declarative_base()
+
 class Experiment(Base):
     __tablename__ = 'experiments'
-    id = Column(Integer, primary_key=True)
+    id = Column(String, primary_key=True)
     name = Column(String)
-    date = Column(String)
+    description = Column(String)
+    created_at = Column(Float)
+    hardware_info = Column(String) # JSON
     file_path = Column(String)
+    
+    sensors = relationship("Sensor", back_populates="experiment", cascade="all, delete-orphan")
+
+class Sensor(Base):
+    __tablename__ = 'sensors'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    experiment_id = Column(String, ForeignKey('experiments.id'))
+    key = Column(String)
+    name = Column(String)
+    unit = Column(String)
+    calibration_scale = Column(Float, default=1.0)
+    calibration_offset = Column(Float, default=0.0)
+    is_derived = Column(Boolean, default=False)
+    derivation_formula = Column(String)
+    
+    experiment = relationship("Experiment", back_populates="sensors")
 
 engine = create_engine('sqlite:///openbench.db', connect_args={"check_same_thread": False})
 Base.metadata.create_all(bind=engine)
@@ -56,32 +77,49 @@ ui_manager = ConnectionManager()
 class AsyncDataLogger:
     def __init__(self):
         self.is_recording = False
+        self.active_experiment_id = None
         self.h5_file = None
         self.datasets = {}
         self.queue = asyncio.Queue()
         self.worker_task = None
+        self.calibration_map = {}
 
-    async def start(self, exp_name: str):
+    def _load_calibration(self, exp_id: str):
+        session = SessionLocal()
+        sensors = session.query(Sensor).filter(Sensor.experiment_id == exp_id).all()
+        self.calibration_map = {s.key: {"scale": s.calibration_scale, "offset": s.calibration_offset} for s in sensors}
+        session.close()
+
+    def apply_calibration(self, key: str, raw_value: float) -> float:
+        cal = self.calibration_map.get(key, {"scale": 1.0, "offset": 0.0})
+        return (raw_value * cal["scale"]) + cal["offset"]
+
+    async def start(self, exp_id: str):
         if self.is_recording: raise Exception("Already recording")
-        timestamp = int(time.time())
-        filename = f"data/exp_{timestamp}.h5"
         
         session = SessionLocal()
-        exp = Experiment(name=exp_name, date=str(timestamp), file_path=filename)
-        session.add(exp)
+        exp = session.query(Experiment).filter(Experiment.id == exp_id).first()
+        if not exp:
+            session.close()
+            raise Exception("Experiment not found")
+        
+        filename = f"data/exp_{exp_id}.h5"
+        exp.file_path = filename
         session.commit()
-        exp_id = exp.id
         session.close()
+
+        self._load_calibration(exp_id)
 
         self.h5_file = h5py.File(filename, 'w')
         self.datasets = {}
+        self.active_experiment_id = exp_id
         self.is_recording = True
         self.worker_task = asyncio.create_task(self._write_worker())
-        return exp_id
 
     async def stop(self):
         if not self.is_recording: return
         self.is_recording = False
+        self.active_experiment_id = None
         await self.queue.join()
         if self.worker_task:
             self.worker_task.cancel()
@@ -115,23 +153,27 @@ class AsyncDataLogger:
         if not self.datasets:
             self.datasets['time_s'] = self.h5_file.create_dataset('time_s', shape=(0,), maxshape=(None,), dtype='f8', chunks=True)
             for key in buffer[0]['sensors'].keys():
-                self.datasets[key] = self.h5_file.create_dataset(key, shape=(0,), maxshape=(None,), dtype='f8', chunks=True)
+                self.datasets[key + "_raw"] = self.h5_file.create_dataset(key + "_raw", shape=(0,), maxshape=(None,), dtype='f8', chunks=True)
+                self.datasets[key + "_cal"] = self.h5_file.create_dataset(key + "_cal", shape=(0,), maxshape=(None,), dtype='f8', chunks=True)
         
         n = len(buffer)
         for key, dset in self.datasets.items():
             if key in self.datasets: dset.resize(dset.shape[0] + n, axis=0)
             
         self.datasets['time_s'][-n:] = [d.get('time_s', 0.0) for d in buffer]
-        for key in self.datasets.keys():
-            if key == 'time_s': continue
-            self.datasets[key][-n:] = [d['sensors'].get(key, 0.0) for d in buffer]
+        for key in buffer[0]['sensors'].keys():
+            raw_vals = [d['sensors'].get(key, 0.0) for d in buffer]
+            cal_vals = [self.apply_calibration(key, v) for v in raw_vals]
+            
+            self.datasets[key + "_raw"][-n:] = raw_vals
+            self.datasets[key + "_cal"][-n:] = cal_vals
 
 logger = AsyncDataLogger()
 
 class DataSourceManager:
     def __init__(self):
         self.active_task = None
-        self.source_type = None # 'simulator' or 'serial'
+        self.source_type = None 
         self.serial_conn = None
 
     async def start_simulator(self):
@@ -174,8 +216,14 @@ class DataSourceManager:
                         "Voltage_V": round(5.0 + random.normalvariate(0, 0.05), 3)
                     }
                 }
+                
+                # Apply live calibration for the UI broadcast
+                calibrated_data = {"time_s": data["time_s"], "sensors": {}}
+                for k, v in data["sensors"].items():
+                    calibrated_data["sensors"][k] = logger.apply_calibration(k, v)
+                    
                 logger.enqueue_data(data)
-                await ui_manager.broadcast(json.dumps(data))
+                await ui_manager.broadcast(json.dumps(calibrated_data))
                 await asyncio.sleep(0.016)
         except asyncio.CancelledError:
             pass
@@ -188,17 +236,21 @@ class DataSourceManager:
                     line = self.serial_conn.readline().decode('utf-8').strip()
                     if line:
                         try:
-                            # Hardware sends: {"sensors": {"Laser_Dist": 5.4}}
                             parsed = json.loads(line)
                             if "sensors" in parsed:
                                 data = {
                                     "time_s": round(time.time() - t_start, 4),
                                     "sensors": parsed["sensors"]
                                 }
+                                
+                                calibrated_data = {"time_s": data["time_s"], "sensors": {}}
+                                for k, v in data["sensors"].items():
+                                    calibrated_data["sensors"][k] = logger.apply_calibration(k, v)
+                                    
                                 logger.enqueue_data(data)
-                                await ui_manager.broadcast(json.dumps(data))
+                                await ui_manager.broadcast(json.dumps(calibrated_data))
                         except json.JSONDecodeError:
-                            pass # Ignore malformed serial lines
+                            pass 
                 await asyncio.sleep(0.001)
         except asyncio.CancelledError:
             pass
@@ -218,6 +270,18 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 
 # --- REST API ---
 
+class ExperimentCreate(BaseModel):
+    name: str
+    description: str
+    hardware_info: str
+
+class SensorConfig(BaseModel):
+    key: str
+    name: str
+    unit: str
+    calibration_scale: float
+    calibration_offset: float
+
 @app.get("/api/ports")
 def get_ports():
     ports = serial.tools.list_ports.comports()
@@ -229,7 +293,7 @@ async def connect_simulator():
     return {"status": "Simulator connected"}
 
 @app.post("/api/source/serial")
-async def connect_serial(payload: dict): # {"port": "COM3"}
+async def connect_serial(payload: dict):
     port = payload.get("port")
     if not port: raise HTTPException(status_code=400, detail="Port missing")
     try:
@@ -246,14 +310,63 @@ async def disconnect_source():
 @app.get("/api/experiments")
 def get_experiments():
     session = SessionLocal()
-    exps = session.query(Experiment).all()
+    exps = session.query(Experiment).order_by(Experiment.created_at.desc()).all()
+    res = [{"id": e.id, "name": e.name, "description": e.description, "created_at": e.created_at, "file_path": e.file_path} for e in exps]
     session.close()
-    return [{"id": e.id, "name": e.name, "date": e.date, "file_path": e.file_path} for e in exps]
+    return res
+
+@app.post("/api/experiments")
+def create_experiment(exp_data: ExperimentCreate):
+    session = SessionLocal()
+    exp_id = str(uuid.uuid4())
+    exp = Experiment(
+        id=exp_id,
+        name=exp_data.name,
+        description=exp_data.description,
+        created_at=time.time(),
+        hardware_info=exp_data.hardware_info,
+        file_path=""
+    )
+    session.add(exp)
+    session.commit()
+    session.close()
+    return {"id": exp_id}
+
+@app.post("/api/experiments/{exp_id}/sensors")
+def configure_sensors(exp_id: str, sensors: list[SensorConfig]):
+    session = SessionLocal()
+    # Delete existing configs for this experiment
+    session.query(Sensor).filter(Sensor.experiment_id == exp_id).delete()
+    for s in sensors:
+        sen = Sensor(
+            experiment_id=exp_id,
+            key=s.key,
+            name=s.name,
+            unit=s.unit,
+            calibration_scale=s.calibration_scale,
+            calibration_offset=s.calibration_offset
+        )
+        session.add(sen)
+    session.commit()
+    session.close()
+    # Live reload calibration if we are actively dealing with it
+    logger._load_calibration(exp_id)
+    return {"status": "ok"}
+
+@app.get("/api/experiments/{exp_id}/sensors")
+def get_experiment_sensors(exp_id: str):
+    session = SessionLocal()
+    sensors = session.query(Sensor).filter(Sensor.experiment_id == exp_id).all()
+    res = [{"key": s.key, "name": s.name, "unit": s.unit, "calibration_scale": s.calibration_scale, "calibration_offset": s.calibration_offset} for s in sensors]
+    session.close()
+    return res
 
 @app.post("/api/record/start")
-async def start_record():
+async def start_record(payload: dict):
+    exp_id = payload.get("exp_id")
+    if not exp_id: raise HTTPException(status_code=400, detail="Experiment ID missing")
     try:
-        exp_id = await logger.start("Hardware Run")
+        await logger.start(exp_id)
         return {"status": "recording", "id": exp_id}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -264,7 +377,7 @@ async def stop_record():
     return {"status": "stopped"}
 
 @app.get("/api/export/{exp_id}")
-def export_experiment(exp_id: int):
+def export_experiment(exp_id: str):
     session = SessionLocal()
     exp = session.query(Experiment).filter(Experiment.id == exp_id).first()
     session.close()
@@ -282,7 +395,7 @@ def export_experiment(exp_id: int):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
         
-    return FileResponse(csv_path, media_type="text/csv", filename=f"{exp.name.replace(' ', '_')}_{exp.date}.csv")
+    return FileResponse(csv_path, media_type="text/csv", filename=f"{exp.name.replace(' ', '_')}.csv")
 
 # --- WebSocket UI Endpoint ---
 
@@ -291,7 +404,7 @@ async def websocket_ui(websocket: WebSocket):
     await ui_manager.connect(websocket)
     try:
         while True:
-            await websocket.receive_text() # Keep connection alive
+            await websocket.receive_text() 
     except WebSocketDisconnect:
         ui_manager.disconnect(websocket)
 
