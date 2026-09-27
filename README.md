@@ -6,7 +6,7 @@ It is designed to replace proprietary, expensive, and closed-source DAQ (Data Ac
 
 It is built on a simple philosophy: **Raw data is authoritative, hardware should not be tied to one vendor, and live visualization should never bottleneck acquisition.**
 
-![OpenBench Dashboard](https://raw.githubusercontent.com/swastikk594-hub/OpenBench/main/frontend/src/assets/hero.png)
+![OpenBench Dashboard](frontend/src/assets/hero.png)
 
 ## The Core Concept
 
